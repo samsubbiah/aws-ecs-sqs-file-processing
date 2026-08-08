@@ -1,20 +1,28 @@
-# POC: ECS Scale to Zero based on SQS
+# POC: ECS Scale to Zero based on SQS — with S3 File Processing
 
 ## Architecture
 
 See full diagram → [architecture.md](./architecture.md)
 
 ```
- Injector ──► SQS Queue ──► CloudWatch Alarm ──► App Auto Scaling
-                  ▲                                      │
-                  │         ECS Fargate Cluster          │
-                  │    ┌──────────────────────────┐      │
-                  └────│  Worker Tasks (0 → N)    │◄─────┘
-                       │  poll → process → delete │
-                       └──────────────────────────┘
+S3 (file drop)
+    │ S3 Event (ObjectCreated)
+    ▼
+Lambda Chunker
+    │ sends chunk descriptors {s3_key, byte_start, byte_end}
+    ▼
+SQS Queue ──► CloudWatch Alarm ──► App Auto Scaling
+                                          │
+                  ECS Fargate Cluster     │
+             ┌────────────────────────┐   │
+             │  Worker Tasks (0 → N) │◄──┘
+             │  poll → S3 Range read │
+             │  parse rows → delete  │
+             └────────────────────────┘
 ```
 
-- Workers poll SQS, process messages, delete them
+- A `.csv` file dropped in S3 triggers Lambda, which splits it into line-aligned chunks and sends descriptors to SQS
+- Workers fetch their chunk via S3 Range reads, parse each row as a business event
 - When queue empties, CloudWatch alarm fires → ECS scales back to 0
 
 ---
@@ -32,16 +40,21 @@ See full diagram → [architecture.md](./architecture.md)
 
 | Resource | Name / ARN |
 |---|---|
+| S3 Input Bucket | `poc-ecs-sqs-input-022784798356` |
+| Lambda Chunker | `poc-ecs-sqs-chunker` |
 | ECR Repository | `poc-ecs-sqs-worker` |
 | SQS Queue | `poc-ecs-sqs-queue` |
 | SQS Queue URL | `https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue` |
+| SQS DLQ | `poc-ecs-sqs-dlq` |
 | ECS Cluster | `poc-ecs-sqs-cluster` |
 | ECS Service | `poc-ecs-sqs-service` |
-| CloudWatch Log Group | `/ecs/poc-ecs-sqs` (retention: 7 days) |
+| CloudWatch Log Group (worker) | `/ecs/poc-ecs-sqs` (retention: 7 days) |
+| CloudWatch Log Group (lambda) | `/aws/lambda/poc-ecs-sqs-chunker` (retention: 7 days) |
 | CloudWatch Alarm (scale-out) | `poc-ecs-sqs-scale-out` |
 | CloudWatch Alarm (scale-in) | `poc-ecs-sqs-scale-in` |
 | IAM Task Role | `poc-ecs-sqs-task-role` |
 | IAM Execution Role | `poc-ecs-sqs-exec-role` |
+| IAM Lambda Role | `poc-ecs-sqs-lambda-chunker-role` |
 | VPC | `poc-ecs-sqs-vpc` (10.0.0.0/16) |
 
 ---
@@ -49,7 +62,6 @@ See full diagram → [architecture.md](./architecture.md)
 ## Step 1 — Build & Push Docker Image
 
 ```bash
-# Set your account/region
 AWS_ACCOUNT=022784798356
 AWS_REGION=us-east-1
 
@@ -66,8 +78,6 @@ docker tag poc-ecs-sqs-worker:latest $AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.
 docker push $AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/poc-ecs-sqs-worker:latest
 ```
 
-> On Windows PowerShell, `python` may not be in PATH — use `py` instead (see Step 3).
-
 ---
 
 ## Step 2 — Deploy Terraform
@@ -78,39 +88,40 @@ terraform init
 terraform apply -var="container_image=$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com/poc-ecs-sqs-worker:latest"
 ```
 
-Terraform creates 22 resources: VPC, subnets, IGW, SQS, ECS cluster/service/task definition, IAM roles, CloudWatch alarms, App Auto Scaling target and policies.
+Terraform creates all resources including: VPC, S3 bucket, Lambda chunker, SQS queue + DLQ, ECS cluster/service/task definition, IAM roles, CloudWatch alarms, App Auto Scaling.
 
-Note the `sqs_queue_url` from the output.
+Note the `s3_input_bucket` from the output.
 
 ---
 
-## Step 3 — Inject Messages (triggers scale out)
+## Step 3 — Drop a CSV File (triggers the pipeline)
+
+Upload any `.csv` file with a header row to the S3 input bucket:
 
 ```bash
-cd injector
-
-# Windows — use py launcher
-py -m pip install -r requirements.txt
-py inject.py --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue --count 50 --region us-east-1
+# Windows
+aws s3 cp your-file.csv s3://poc-ecs-sqs-input-022784798356/
 
 # Linux/macOS
-pip install -r requirements.txt
-python inject.py --queue-url <sqs_queue_url> --count 50 --region us-east-1
+aws s3 cp your-file.csv s3://$(terraform output -raw s3_input_bucket)/
 ```
 
-Expected output:
+Expected CSV format (header required):
+
 ```
-Sent 10/50 messages
-Sent 20/50 messages
+event_id,event_type,payload
+1,ORDER_PLACED,{"item":"abc"}
+2,ORDER_PLACED,{"item":"xyz"}
 ...
-Done. Total sent: 50
 ```
+
+Lambda will automatically chunk the file into groups of 1000 lines and send each chunk as an SQS message.
 
 ---
 
 ## Step 4 — Observe Scale to Zero
 
-Once all messages are processed, the CloudWatch alarm fires after ~2 minutes (2 consecutive 0-message periods) and ECS scales back to 0 tasks.
+Once all chunks are processed, the CloudWatch alarm fires after ~2 minutes (2 consecutive 0-message periods) and ECS scales back to 0 tasks.
 
 ---
 
@@ -127,6 +138,19 @@ aws sqs get-queue-attributes \
   --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
   --attribute-names ApproximateNumberOfMessages \
   --region us-east-1
+```
+
+### Check DLQ for failed chunks
+```bash
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-dlq \
+  --attribute-names ApproximateNumberOfMessages \
+  --region us-east-1
+```
+
+### Check Lambda chunker logs
+```bash
+aws logs tail /aws/lambda/poc-ecs-sqs-chunker --follow --region us-east-1
 ```
 
 ### Check ECS task counts
@@ -169,8 +193,6 @@ aws logs tail /ecs/poc-ecs-sqs --follow --region us-east-1
 
 ### Manually force scale out (bypass alarm wait)
 ```bash
-# SQS metrics take up to 5 min to appear in CloudWatch.
-# Use this to force tasks to start immediately for testing.
 aws ecs update-service \
   --cluster poc-ecs-sqs-cluster \
   --service poc-ecs-sqs-service \
@@ -202,20 +224,38 @@ Cooldown: 60s scale-out, 120s scale-in (2 consecutive 0-message periods).
 
 ---
 
+## Chunking Logic
+
+| Setting | Value |
+|---|---|
+| Trigger | S3 `ObjectCreated` on `.csv` files |
+| Lines per chunk | 1000 (configurable via `LINES_PER_CHUNK` Lambda env var) |
+| Chunk format | S3 byte range descriptor (header + data range) |
+| DLQ retries | 3 attempts before dead-lettering |
+| Lambda timeout | 15 minutes (supports large files) |
+
+Workers perform two S3 Range reads per message — one for the header row, one for the assigned chunk — then parse and process each row as a business event.
+
+---
+
 ## Known Behaviours
 
 | Behaviour | Explanation |
 |---|---|
-| Alarm stuck in `INSUFFICIENT_DATA` after inject | SQS publishes metrics to CloudWatch every ~5 min. Use manual `update-service` to test immediately. |
+| Alarm stuck in `INSUFFICIENT_DATA` after file drop | SQS publishes metrics to CloudWatch every ~5 min. Use manual `update-service` to test immediately. |
 | `python` not found on Windows | Use `py inject.py ...` instead of `python inject.py ...` |
 | PowerShell strips single quotes from JSON args | Use `aws ecs update-service --desired-count N` instead of complex JSON policy commands in PowerShell |
 | Tasks pending for 60–90s after scale-out | Normal Fargate cold start time for image pull + container init |
+| Lambda streams large files | Lambda never loads the full file into memory — it streams line by line, safe for files larger than Lambda memory |
 
 ---
 
 ## Tear Down
 
 ```bash
+# Empty the S3 bucket first (required before destroy)
+aws s3 rm s3://poc-ecs-sqs-input-022784798356 --recursive
+
 cd terraform
 terraform destroy -var="container_image=dummy"
 
