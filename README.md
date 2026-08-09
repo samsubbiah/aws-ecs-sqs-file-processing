@@ -125,14 +125,63 @@ Once all chunks are processed, the CloudWatch alarm fires after ~2 minutes (2 co
 
 ---
 
-## Testing & Monitoring Commands
+## Testing Guide
 
-### Verify AWS identity
+### Test 1 — Generate a test CSV
+
+Use the included generator script to produce a CSV with any number of rows:
+
 ```bash
-aws sts get-caller-identity
+# Windows — generates test_events.csv with 3000 rows (3 chunks of 1000)
+py gen_test.py
 ```
 
-### Check messages in queue
+Or generate inline for a custom row count:
+
+```bash
+# Windows
+py -c "
+lines = ['event_id,event_type,payload']
+for i in range(1, 5001):
+    lines.append(f'{i},ORDER_PLACED,{{\"item\":\"product_{i}\"}}') 
+open('test_events.csv', 'w').write('\n'.join(lines) + '\n')
+print('done')
+"
+```
+
+Expected CSV format (header row required):
+
+```
+event_id,event_type,payload
+1,ORDER_PLACED,{"item":"abc"}
+2,ORDER_PLACED,{"item":"xyz"}
+```
+
+---
+
+### Test 2 — Full end-to-end pipeline test
+
+**Step 1 — Upload CSV to S3 (triggers Lambda automatically)**
+
+```bash
+aws s3 cp test_events.csv s3://poc-ecs-sqs-input-022784798356/test_events.csv --region us-east-1
+```
+
+**Step 2 — Confirm Lambda chunker fired (~15–20s after upload)**
+
+```bash
+aws logs tail /aws/lambda/poc-ecs-sqs-chunker --region us-east-1
+```
+
+Expected output:
+```
+START RequestId: ...
+END RequestId: ...
+REPORT ... Duration: ~250ms
+```
+
+**Step 3 — Confirm SQS received chunk messages**
+
 ```bash
 aws sqs get-queue-attributes \
   --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
@@ -140,20 +189,87 @@ aws sqs get-queue-attributes \
   --region us-east-1
 ```
 
-### Check DLQ for failed chunks
+Expected: `ApproximateNumberOfMessages` = number of chunks (e.g. 3 for a 3000-row file)
+
+**Step 4 — Scale out ECS workers to process the queue**
+
+> CloudWatch alarms take ~5 min to trigger auto-scaling. Use this to test immediately:
+
 ```bash
+aws ecs update-service \
+  --cluster poc-ecs-sqs-cluster \
+  --service poc-ecs-sqs-service \
+  --desired-count 2 \
+  --region us-east-1
+```
+
+**Step 5 — Watch workers process chunks (live)**
+
+```bash
+aws logs tail /ecs/poc-ecs-sqs --follow --region us-east-1
+```
+
+Expected output per worker per chunk:
+```
+Worker started, polling queue...
+Pulled 3 message(s) from queue
+Processed 1000 records from test_events.csv [29-40815]
+Processed 1000 records from test_events.csv [40815-83815]
+Processed 1000 records from test_events.csv [83815-126815]
+```
+
+**Step 6 — Confirm queue drained and DLQ is empty**
+
+```bash
+# Main queue — expect 0
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+  --region us-east-1
+
+# DLQ — expect 0 (any value here means a chunk failed 3 times)
 aws sqs get-queue-attributes \
   --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-dlq \
   --attribute-names ApproximateNumberOfMessages \
   --region us-east-1
 ```
 
-### Check Lambda chunker logs
+---
+
+### Test 3 — Invoke Lambda directly (bypass S3 trigger)
+
+Useful for testing the chunker in isolation without uploading a new file:
+
 ```bash
-aws logs tail /aws/lambda/poc-ecs-sqs-chunker --follow --region us-east-1
+aws lambda invoke \
+  --function-name poc-ecs-sqs-chunker \
+  --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"Records":[{"s3":{"bucket":{"name":"poc-ecs-sqs-input-022784798356"},"object":{"key":"test_events.csv"}}}]}' \
+  response.json && type response.json
 ```
 
-### Check ECS task counts
+Expected: `null` (no error). Then check SQS for new messages.
+
+---
+
+### Test 4 — Scale-to-zero test
+
+Verify ECS scales back to 0 after the queue drains:
+
+**Step 1 — Wait for queue to empty, then check alarm state**
+
+```bash
+aws cloudwatch describe-alarms \
+  --alarm-names poc-ecs-sqs-scale-in \
+  --query "MetricAlarms[0].{State:StateValue,Reason:StateReason}" \
+  --region us-east-1
+```
+
+Expected after ~2 minutes of empty queue: `State: ALARM`
+
+**Step 2 — Confirm ECS scaled to 0**
+
 ```bash
 aws ecs describe-services \
   --cluster poc-ecs-sqs-cluster \
@@ -162,8 +278,129 @@ aws ecs describe-services \
   --query "services[0].{desired:desiredCount,running:runningCount,pending:pendingCount}"
 ```
 
-### Check CloudWatch alarm state
+Expected: `desired: 0, running: 0, pending: 0`
+
+**Step 3 — Check auto-scaling activity log**
+
 ```bash
+aws application-autoscaling describe-scaling-activities \
+  --service-namespace ecs \
+  --resource-id service/poc-ecs-sqs-cluster/poc-ecs-sqs-service \
+  --region us-east-1 \
+  --query "ScalingActivities[0:5].{Status:StatusCode,Cause:Cause,Time:StartTime}"
+```
+
+---
+
+### Test 5 — DLQ / failure test
+
+Verify failed chunks are dead-lettered after 3 retries:
+
+**Step 1 — Send a deliberately malformed message**
+
+```bash
+aws sqs send-message \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
+  --message-body '{"s3_bucket":"poc-ecs-sqs-input-022784798356","s3_key":"nonexistent.csv","byte_start":0,"byte_end":100,"header_end":50}' \
+  --region us-east-1
+```
+
+**Step 2 — Scale out a worker to pick it up**
+
+```bash
+aws ecs update-service \
+  --cluster poc-ecs-sqs-cluster \
+  --service poc-ecs-sqs-service \
+  --desired-count 1 \
+  --region us-east-1
+```
+
+**Step 3 — Watch it fail in worker logs**
+
+```bash
+aws logs tail /ecs/poc-ecs-sqs --follow --region us-east-1
+```
+
+Expected: `ERROR Failed to process message ...: ...` repeated 3 times
+
+**Step 4 — Confirm message moved to DLQ**
+
+```bash
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-dlq \
+  --attribute-names ApproximateNumberOfMessages \
+  --region us-east-1
+```
+
+Expected: `ApproximateNumberOfMessages: 1`
+
+**Step 5 — Purge DLQ after investigation**
+
+```bash
+aws sqs purge-queue \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-dlq \
+  --region us-east-1
+```
+
+---
+
+### Test 6 — Large file test
+
+Verify the pipeline handles files larger than Lambda memory (256MB limit):
+
+```bash
+# Generate a 100,000-row file (100 chunks)
+py -c "
+lines = ['event_id,event_type,payload']
+for i in range(1, 100001):
+    lines.append(f'{i},ORDER_PLACED,{{\"item\":\"product_{i}\"}}') 
+open('large_test.csv', 'w').write('\n'.join(lines) + '\n')
+print('done')
+"
+
+aws s3 cp large_test.csv s3://poc-ecs-sqs-input-022784798356/ --region us-east-1
+```
+
+Then scale out workers and confirm all 100 chunks are processed:
+
+```bash
+aws ecs update-service \
+  --cluster poc-ecs-sqs-cluster \
+  --service poc-ecs-sqs-service \
+  --desired-count 5 \
+  --region us-east-1
+```
+
+---
+
+### Monitoring Commands (quick reference)
+
+```bash
+# ECS task counts
+aws ecs describe-services \
+  --cluster poc-ecs-sqs-cluster \
+  --services poc-ecs-sqs-service \
+  --region us-east-1 \
+  --query "services[0].{desired:desiredCount,running:runningCount,pending:pendingCount}"
+
+# SQS queue depth
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+  --region us-east-1
+
+# DLQ depth
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-dlq \
+  --attribute-names ApproximateNumberOfMessages \
+  --region us-east-1
+
+# Lambda logs
+aws logs tail /aws/lambda/poc-ecs-sqs-chunker --follow --region us-east-1
+
+# Worker logs (live)
+aws logs tail /ecs/poc-ecs-sqs --follow --region us-east-1
+
 # Scale-out alarm
 aws cloudwatch describe-alarms \
   --alarm-names poc-ecs-sqs-scale-out \
@@ -175,37 +412,24 @@ aws cloudwatch describe-alarms \
   --alarm-names poc-ecs-sqs-scale-in \
   --query "MetricAlarms[0].{State:StateValue,Reason:StateReason}" \
   --region us-east-1
-```
 
-### Check Auto Scaling activity
-```bash
+# Auto-scaling activity
 aws application-autoscaling describe-scaling-activities \
   --service-namespace ecs \
   --resource-id service/poc-ecs-sqs-cluster/poc-ecs-sqs-service \
   --region us-east-1 \
   --query "ScalingActivities[0:5].{Status:StatusCode,Cause:Cause,Time:StartTime}"
-```
 
-### Tail worker logs (live)
-```bash
-aws logs tail /ecs/poc-ecs-sqs --follow --region us-east-1
-```
-
-### Manually force scale out (bypass alarm wait)
-```bash
-aws ecs update-service \
-  --cluster poc-ecs-sqs-cluster \
-  --service poc-ecs-sqs-service \
-  --desired-count 3 \
-  --region us-east-1
-```
-
-### Manually scale back to zero
-```bash
+# Manually scale to zero
 aws ecs update-service \
   --cluster poc-ecs-sqs-cluster \
   --service poc-ecs-sqs-service \
   --desired-count 0 \
+  --region us-east-1
+
+# Purge main queue (reset between tests)
+aws sqs purge-queue \
+  --queue-url https://sqs.us-east-1.amazonaws.com/022784798356/poc-ecs-sqs-queue \
   --region us-east-1
 ```
 
