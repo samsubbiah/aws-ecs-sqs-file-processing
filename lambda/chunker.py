@@ -12,31 +12,49 @@ def handler(event, context):
     bucket = record["s3"]["bucket"]["name"]
     key    = record["s3"]["object"]["key"]
 
-    stream     = s3.get_object(Bucket=bucket, Key=key)["Body"]
-    entries    = []
-    chunk_id   = 0
-    byte_pos   = 0
+    stream      = s3.get_object(Bucket=bucket, Key=key)["Body"]
+    entries     = []
+    chunk_id    = 0
+    byte_pos    = 0
     chunk_start = 0
     line_count  = 0
     header_end  = None
+    leftover    = b""
 
-    for raw_line in stream.iter_lines():
-        line_len = len(raw_line) + 1  # +1 for \n
+    for raw_chunk in stream.iter_chunks(chunk_size=1024 * 1024):
+        data  = leftover + raw_chunk
+        lines = data.split(b"\n")
+        # last element may be incomplete — carry it over
+        leftover = lines.pop()
 
+        for line in lines:
+            line_len = len(line) + 1  # +1 for the \n we split on
+
+            if header_end is None:
+                header_end = byte_pos + line_len
+                byte_pos   = header_end
+                continue
+
+            if line_count == 0:
+                chunk_start = byte_pos
+
+            line_count += 1
+            byte_pos   += line_len
+
+            if line_count == LINES_PER_CHUNK:
+                entries, chunk_id = _enqueue(entries, chunk_id, bucket, key, chunk_start, byte_pos, header_end)
+                line_count = 0
+
+    # handle any remaining bytes in leftover (file with no trailing newline)
+    if leftover:
+        line_len = len(leftover)
         if header_end is None:
             header_end = byte_pos + line_len
-            byte_pos   = header_end
-            continue
-
-        if line_count == 0:
-            chunk_start = byte_pos
-
-        line_count += 1
-        byte_pos   += line_len
-
-        if line_count == LINES_PER_CHUNK:
-            entries, chunk_id = _enqueue(entries, chunk_id, bucket, key, chunk_start, byte_pos, header_end)
-            line_count = 0
+        else:
+            if line_count == 0:
+                chunk_start = byte_pos
+            line_count += 1
+            byte_pos   += line_len
 
     if line_count > 0:
         entries, chunk_id = _enqueue(entries, chunk_id, bucket, key, chunk_start, byte_pos, header_end)

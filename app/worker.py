@@ -33,7 +33,8 @@ def process_chunk(msg):
         Range=f"bytes={byte_start}-{byte_end - 1}"
     )["Body"].read().decode()
 
-    reader = csv.DictReader(io.StringIO(header + chunk))
+    combined = (header + chunk).replace('\r\n', '\n').replace('\r', '\n')
+    reader = csv.DictReader(io.StringIO(combined))
     count = 0
     for row in reader:
         _process_row(row)
